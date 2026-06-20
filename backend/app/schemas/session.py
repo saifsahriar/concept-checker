@@ -3,11 +3,11 @@ from pydantic import BaseModel, Field, model_validator
 
 
 class CreateSessionRequest(BaseModel):
-    concept: str = Field(min_length=2, max_length=500)
+    concept: str = Field(min_length=1, max_length=500)
 
 
 class InitialExplanationRequest(BaseModel):
-    explanation: str = Field(min_length=10, max_length=5000)
+    explanation: str = Field(max_length=5000)
 
 
 class FollowupAnswersRequest(BaseModel):
@@ -17,10 +17,8 @@ class FollowupAnswersRequest(BaseModel):
     def validate_answers(self) -> "FollowupAnswersRequest":
         if len(self.answers) != 2:
             raise ValueError("Exactly two follow-up answers are required")
-        cleaned = [answer.strip() for answer in self.answers]
-        if any(not answer for answer in cleaned):
-            raise ValueError("Follow-up answers cannot be empty")
-        self.answers = cleaned
+        # Allow empty answers so the LLM can evaluate "I don't know" or blank submissions gracefully
+        self.answers = [answer.strip() for answer in self.answers]
         return self
 
 

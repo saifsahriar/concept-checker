@@ -6,8 +6,13 @@ from dataclasses import dataclass
 from typing import Any
 
 import httpx
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from app.core.config import Settings
+
+
+class LLMError(Exception):
+    pass
 
 
 INITIAL_SYSTEM_PROMPT = (
@@ -214,19 +219,16 @@ class NimClient:
             "temperature": 0.3,
             "max_tokens": 500,
         }
-        data = await self._chat_completions(payload)
-        if data is None:
-            return self._fallback_initial(concept, explanation)
-        content = self._extract_message(data)
-        parsed = _extract_json_block(content or "")
-        if parsed:
+        try:
+            parsed = await self._get_json_completion(payload)
             return InitialAnalysis(
                 knowledge_gap=_format_text_value(parsed.get("knowledge_gap")) or self._fallback_initial(concept, explanation).knowledge_gap,
                 strengths=_format_text_value(parsed.get("strengths")) or "Identifies the concept at a surface level.",
                 weaknesses=_format_text_value(parsed.get("weaknesses")) or "The explanation is still missing the underlying purpose.",
                 followup_questions=_normalize_questions(parsed.get("followup_questions"), concept, str(parsed.get("knowledge_gap", ""))),
             )
-        return self._fallback_initial(concept, explanation)
+        except LLMError:
+            return self._fallback_initial(concept, explanation)
 
     async def evaluate_final(
         self,
@@ -263,12 +265,8 @@ class NimClient:
             "temperature": 0.2,
             "max_tokens": 600,
         }
-        data = await self._chat_completions(payload)
-        if data is None:
-            return self._fallback_final(concept, explanation, answers, knowledge_gap)
-        content = self._extract_message(data)
-        parsed = _extract_json_block(content or "")
-        if parsed:
+        try:
+            parsed = await self._get_json_completion(payload)
             return FinalEvaluation(
                 knowledge_gap=_format_text_value(parsed.get("knowledge_gap")) or knowledge_gap,
                 strengths=_format_text_value(parsed.get("strengths")) or "Shows partial conceptual understanding.",
@@ -276,9 +274,16 @@ class NimClient:
                 final_feedback=_format_text_value(parsed.get("final_feedback")) or "Keep studying the underlying purpose of the concept.",
                 understanding_score=self._coerce_score(parsed.get("understanding_score")),
             )
-        return self._fallback_final(concept, explanation, answers, knowledge_gap)
+        except LLMError:
+            return self._fallback_final(concept, explanation, answers, knowledge_gap)
 
-    async def _chat_completions(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type(LLMError),
+        reraise=True,
+    )
+    async def _get_json_completion(self, payload: dict[str, Any]) -> dict[str, Any]:
         try:
             response = await self._client.post(
                 "/chat/completions",
@@ -286,9 +291,15 @@ class NimClient:
                 json=payload,
             )
             response.raise_for_status()
-            return response.json()
-        except (httpx.TimeoutException, httpx.RequestError, httpx.HTTPStatusError):
-            return None
+            data = response.json()
+        except (httpx.TimeoutException, httpx.RequestError, httpx.HTTPStatusError) as e:
+            raise LLMError(f"HTTP error: {e}") from e
+
+        content = self._extract_message(data)
+        parsed = _extract_json_block(content or "")
+        if not parsed:
+            raise LLMError("Failed to parse valid JSON from LLM response")
+        return parsed
 
     @staticmethod
     def _extract_message(data: dict[str, Any]) -> str:
